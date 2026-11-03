@@ -1,0 +1,22 @@
+services:
+  mm-es-proxy:
+    image: mm-es-substring-proxy:latest
+    # build: .            # 取消注释可直接从源码构建
+    container_name: mm-es-proxy
+    restart: unless-stopped
+    ports:
+      - "9210:9210"
+    environment:
+      # 真实 Elasticsearch 地址
+      ES_UPSTREAM: "http://192.168.248.34:9200"
+      # 代理监听地址（容器内端口，与 ports 映射对应）
+      LISTEN_ADDR: ":9210"
+      # 需要重写的索引名前缀，多个用逗号分隔；需与 mm 的 IndexPrefix 对应
+      # 索引固定以 posts 开头（posts_2026_11_03 等），默认 posts 即可
+      POSTS_PATTERN: "posts"
+      # ngram match 的 minimum_should_match（搜索内容和被切分文档的匹配程度）
+      MSM: "75%"
+      # 1=打印重写后的 ES DSL 到日志（调试用），生产可改 0 关掉
+      DUMP_DSL: "1"
+      # 每日新索引自动补 message.ngram 子字段（内置开关，1=开启）
+      AUTO_PATCH_NGRAM: "1"
