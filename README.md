@@ -1,9 +1,6 @@
 # mm-es-substring-proxy
 
-[![Go Version](https://img.shields.io/badge/go-1.22-00ADD8?logo=go)](https://go.dev)
-[![License](https://img.shields.io/badge/license-internal-lightgrey)](#许可)
-
-一个介于 [Mattermost](https://mattermost.com) 与 Elasticsearch 之间的透明反向代理,为 mm 的消息搜索注入**任意位置子串匹配**能力——不修改 mm 源码,对 mm 完全无感知。
+一个介于 Mattermost 与 Elasticsearch 之间的透明反向代理,为 mm 的消息搜索注入**任意位置子串匹配**能力——不修改 mm 源码,对 mm 完全无感知。
 
 ## 简介
 
