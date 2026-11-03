@@ -1,0 +1,3 @@
+[submodule "libs/build-kits"]
+	path = libs/build-kits
+	url = git@192.168.16.126:lk-ops-libs/build-kits.git
