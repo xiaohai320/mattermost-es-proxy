@@ -14,9 +14,11 @@ services:
       # 需要重写的索引名前缀，多个用逗号分隔；需与 mm 的 IndexPrefix 对应
       # 索引固定以 posts 开头（posts_2026_11_03 等），默认 posts 即可
       POSTS_PATTERN: "posts"
-      # ngram match 的 minimum_should_match（搜索内容和被切分文档的匹配程度）
-      MSM: "75%"
       # 1=打印重写后的 ES DSL 到日志（调试用），生产可改 0 关掉
       DUMP_DSL: "1"
-      # 每日新索引自动补 message.ngram 子字段（内置开关，1=开启）
+      # 每日新索引自动补 message 子字段（内置开关，1=开启；字段随 SUBSTRING_MODE 变化）
       AUTO_PATCH_NGRAM: "1"
+      # 子串匹配策略：wildcard（默认，精确子串/小索引）或 ngram（MSM 容错/索引膨胀 3~5 倍）
+      SUBSTRING_MODE: "wildcard"
+      # ngram 模式的 minimum_should_match（wildcard 模式忽略）
+      MSM: "75%"

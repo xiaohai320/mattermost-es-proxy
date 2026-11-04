@@ -1,27 +1,37 @@
 // mm-es-substring-proxy: a reverse proxy between Mattermost and Elasticsearch
-// that injects a substring (ngram) match on `message.ngram` into posts search
-// queries, so Mattermost gets arbitrary-position substring search without
-// modifying Mattermost source code.
+// that injects a substring match into posts search queries, so Mattermost
+// gets arbitrary-position substring search without modifying Mattermost
+// source code. Two interchangeable strategies, selected by SUBSTRING_MODE:
+//
+//   - wildcard (default): exact, case-insensitive substring via a
+//     message.wildcard sub-field (ES >= 7.9). Small index size, no fuzz.
+//   - ngram: token-window substring via a message.ngram sub-field (requires
+//     the substring_analyzer defined in index settings) with
+//     minimum_should_match fuzzing (MSM, default 75%). 3~5x index bloat,
+//     tolerant of near-matches.
 //
 // Behavior:
 //   - POST {index-pattern}/_search where index matches POSTS_PATTERN: parse body,
 //     wrap every message-targeting leaf clause (including ones under must_not)
-//     in place with {"bool":{"should":[orig, ngram-match]}} — each clause gets
-//     its own term, so exclusions stay substring-aware while positive terms
-//     never leak into negation branches. Existing semantics are preserved.
+//     in place with {"bool":{"should":[orig, substring-match]}} — each clause
+//     gets its own term, so exclusions stay substring-aware while positive
+//     terms never leak into negation branches. Existing semantics preserved.
 //   - Everything else: transparent pass-through (streaming).
 //
 // Env:
 //
-//	ES_UPSTREAM        upstream ES base URL (default http://192.168.248.34:9200)
+//	ES_UPSTREAM        upstream ES base URL (default http://1.1.1.1:9200; set it!)
 //	LISTEN_ADDR        listen address (default :9210)
 //	POSTS_PATTERN      comma-separated prefixes to rewrite (default posts)
 //	                  (any index whose name starts with any entry gets rewritten;
 //	                  use "posts_" if you also have non-daily posts* indices that
 //	                  must stay out of the rewrite)
-//	MSM                minimum_should_match for the ngram match (default 75%)
-//	AUTO_PATCH_NGRAM   =1 to auto-add the missing message.ngram sub-field on
-//	                  daily indexes (best-effort, see ensureNgramFields)
+//	SUBSTRING_MODE     "wildcard" (default) or "ngram" — the substring strategy
+//	MSM                minimum_should_match for the ngram match (default 75%,
+//	                  ngram mode only)
+//	AUTO_PATCH_NGRAM   =1 to auto-add the missing message sub-field on daily
+//	                  indexes (best-effort; name kept for config compatibility,
+//	                  the field patched depends on SUBSTRING_MODE)
 //
 // Auth: none configured here. The inbound Authorization header (sent by
 // Mattermost's ElasticsearchSettings Username/Password) is forwarded to the
@@ -46,25 +56,111 @@ import (
 	"time"
 )
 
-// wrapLeaf replaces one leaf clause in place with
-// bool{should:[orig-leaf, ngram-match]} and returns it as JSON. Because it
-// only replaces the message clause itself, all sibling restrictions (channel
-// filters, user filters, type filters in the enclosing bool) keep applying
-// automatically — no filter copying needed, no permission leak.
-func wrapLeaf(queryType string, origClause json.RawMessage, term, msm string) json.RawMessage {
-	ngramMatch := map[string]interface{}{
-		"match": map[string]interface{}{
-			"message.ngram": map[string]interface{}{
-				"query":                term,
-				"minimum_should_match": msm,
+// wildcardEscaper escapes the three characters that have special meaning in a
+// wildcard query (* ? \) so a user-typed term is matched literally, with the
+// surrounding * we add ourselves being the only wildcards in the pattern.
+// Package-level: strings.NewReplacer builds an internal table, so it must not
+// be constructed per call.
+var wildcardEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`*`, `\*`,
+	`?`, `\?`,
+)
+
+func escapeWildcard(term string) string {
+	return wildcardEscaper.Replace(term)
+}
+
+// strategy holds everything that varies between the substring modes; one
+// instance is resolved from SUBSTRING_MODE at startup (see resolveStrategy).
+type strategy struct {
+	name         string // "wildcard" or "ngram" (for logs)
+	subField     string // message.<subField> is the field we ensure and query
+	mappingPatch map[string]interface{}
+}
+
+var (
+	strat *strategy
+	msm   string
+)
+
+// resolveStrategy maps SUBSTRING_MODE to a concrete strategy. Called once
+// from main; mode dispatch must not happen anywhere else.
+func resolveStrategy(mode string) *strategy {
+	switch mode {
+	case "ngram":
+		return &strategy{
+			name:     "ngram",
+			subField: "ngram",
+			mappingPatch: map[string]interface{}{
+				"properties": map[string]interface{}{
+					"message": map[string]interface{}{
+						"type": "text",
+						"fields": map[string]interface{}{
+							"ngram": map[string]interface{}{
+								"type":            "text",
+								"analyzer":        "substring_analyzer",
+								"search_analyzer": "substring_analyzer",
+							},
+						},
+					},
+				},
+			},
+		}
+	default: // "wildcard"
+		return &strategy{
+			name:     "wildcard",
+			subField: "wildcard",
+			mappingPatch: map[string]interface{}{
+				"properties": map[string]interface{}{
+					"message": map[string]interface{}{
+						"type": "text",
+						"fields": map[string]interface{}{
+							"wildcard": map[string]interface{}{
+								"type": "wildcard",
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+}
+
+// substringMatch builds the substring branch injected alongside the original
+// leaf clause.
+func (s *strategy) substringMatch(term string) map[string]interface{} {
+	if s.name == "ngram" {
+		return map[string]interface{}{
+			"match": map[string]interface{}{
+				"message." + s.subField: map[string]interface{}{
+					"query":                term,
+					"minimum_should_match": msm,
+				},
+			},
+		}
+	}
+	return map[string]interface{}{
+		"wildcard": map[string]interface{}{
+			"message." + s.subField: map[string]interface{}{
+				"value": "*" + escapeWildcard(term) + "*",
 			},
 		},
 	}
+}
+
+// wrapLeaf replaces one leaf clause in place with
+// bool{should:[orig-leaf, substring-match]} and returns it as JSON. Because it
+// only replaces the message clause itself, all sibling restrictions (channel
+// filters, user filters, type filters in the enclosing bool) keep applying
+// automatically — no filter copying needed, no permission leak.
+// The substring branch comes from the selected strategy (see resolveStrategy).
+func wrapLeaf(queryType string, origClause json.RawMessage, term string) json.RawMessage {
 	inner := map[string]interface{}{
 		"bool": map[string]interface{}{
 			"should": []interface{}{
 				map[string]interface{}{queryType: json.RawMessage(origClause)},
-				ngramMatch,
+				strat.substringMatch(term),
 			},
 			"minimum_should_match": 1,
 		},
@@ -76,7 +172,8 @@ func wrapLeaf(queryType string, origClause json.RawMessage, term, msm string) js
 // rewriteQuery walks the query tree exactly once, doing both jobs the old
 // extract/inject pair did separately: for every leaf clause that targets a
 // message field it records the user-typed term AND replaces the leaf in place
-// with a bool{should:[orig, ngram-match]} branch. This includes leaves under
+// with a bool{should:[orig, substring-match]} branch (the match shape depends
+// on the selected strategy). This includes leaves under
 // must_not — a negation must also exclude substring matches — but crucially
 // each clause only ever gets its own term: a positive term from elsewhere in
 // the tree is never OR'd into a negation branch (that would wrongly exclude
@@ -84,7 +181,7 @@ func wrapLeaf(queryType string, origClause json.RawMessage, term, msm string) js
 //
 // Returns the (possibly rewritten) query, the terms found, and an error only
 // if the query JSON itself is malformed (propagated from recursion).
-func rewriteQuery(query json.RawMessage, msm string) (json.RawMessage, []string, error) {
+func rewriteQuery(query json.RawMessage) (json.RawMessage, []string, error) {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(query, &probe); err != nil {
 		return query, nil, err
@@ -100,7 +197,7 @@ func rewriteQuery(query json.RawMessage, msm string) (json.RawMessage, []string,
 			if err := json.Unmarshal(raw, &sqs); err == nil && sqs.Query != "" {
 				f, _ := json.Marshal(sqs.Fields)
 				if string(f) == "null" || string(f) == "" || strings.Contains(string(f), "message") {
-					return wrapLeaf(key, raw, sqs.Query, msm), []string{sqs.Query}, nil
+					return wrapLeaf(key, raw, sqs.Query), []string{sqs.Query}, nil
 				}
 			}
 		}
@@ -126,7 +223,7 @@ func rewriteQuery(query json.RawMessage, msm string) (json.RawMessage, []string,
 					if s == "" {
 						continue
 					}
-					return wrapLeaf(key, raw, s, msm), []string{s}, nil
+					return wrapLeaf(key, raw, s), []string{s}, nil
 				}
 			}
 		}
@@ -140,7 +237,7 @@ func rewriteQuery(query json.RawMessage, msm string) (json.RawMessage, []string,
 		if err := json.Unmarshal(raw, &m); err == nil && m.Query != "" {
 			f, _ := json.Marshal(m.Fields)
 			if string(f) == "null" || string(f) == "" || strings.Contains(string(f), "message") {
-				return wrapLeaf("multi_match", raw, m.Query, msm), []string{m.Query}, nil
+				return wrapLeaf("multi_match", raw, m.Query), []string{m.Query}, nil
 			}
 		}
 	}
@@ -165,7 +262,7 @@ func rewriteQuery(query json.RawMessage, msm string) (json.RawMessage, []string,
 			out := make([]json.RawMessage, 0, len(arr))
 			anyChanged := false
 			for _, clause := range arr {
-				newClause, t, err := rewriteQuery(clause, msm)
+				newClause, t, err := rewriteQuery(clause)
 				if err != nil {
 					return query, nil, err
 				}
@@ -210,7 +307,7 @@ func rewriteSearch(body []byte) ([]byte, error) {
 	if !ok || len(q) == 0 {
 		return body, nil
 	}
-	nq, terms, err := rewriteQuery(q, msm)
+	nq, terms, err := rewriteQuery(q)
 	if err != nil {
 		return nil, err
 	}
@@ -255,13 +352,12 @@ var (
 	upstream      *url.URL
 	listenAddr    string
 	postsPrefixes []string
-	msm           string
 
-	// ngram sub-field auto-patch: mm's own index template defines "message"
-	// explicitly, which drops our message.ngram sub-field on every new daily
-	// index (posts_2026_11_04 etc). The proxy remembers which concrete index
-	// names it has already patched and PUTs the missing mapping once per
-	// index, right before forwarding the first request that touches it.
+	// substring sub-field auto-patch: mm's own index template defines "message"
+	// explicitly, which drops our message.<subField> on every new daily index
+	// (posts_2026_11_04 etc). The proxy remembers which concrete index names
+	// it has already patched and PUTs the missing mapping once per index,
+	// right before forwarding the first request that touches it.
 	// Auth: the patch calls re-use the Authorization header from the most
 	// recent client request (mm sends its ES credentials on every call, and
 	// since auth is pass-through the proxy holds no credentials of its own).
@@ -277,23 +373,31 @@ var (
 	mappingClient = &http.Client{Timeout: 10 * time.Second}
 )
 
-var ngramMappingPatch = map[string]interface{}{
-	"properties": map[string]interface{}{
-		"message": map[string]interface{}{
-			"type": "text",
-			"fields": map[string]interface{}{
-				"ngram": map[string]interface{}{
-					"type":            "text",
-					"analyzer":        "substring_analyzer",
-					"search_analyzer": "substring_analyzer",
-				},
-			},
-		},
-	},
+// hasSubField reports whether the strategy's sub-field already exists in a
+// mapping document.
+func hasSubField(mapping json.RawMessage, subField string) bool {
+	var doc struct {
+		Mappings struct {
+			Properties struct {
+				Message struct {
+					Fields json.RawMessage `json:"fields"`
+				} `json:"message"`
+			} `json:"properties"`
+		} `json:"mappings"`
+	}
+	if json.Unmarshal(mapping, &doc) != nil {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(doc.Mappings.Properties.Message.Fields, &fields) != nil {
+		return false
+	}
+	_, ok := fields[subField]
+	return ok
 }
 
 // rememberAuth captures the inbound Authorization header so background
-// maintenance calls (ngram patch) can authenticate to upstream.
+// maintenance calls (substring patch) can authenticate to upstream.
 func rememberAuth(r *http.Request) {
 	if v := r.Header.Get("Authorization"); v != "" {
 		lastAuth.Lock()
@@ -308,14 +412,14 @@ func patchAuthHeader() string {
 	return lastAuth.header
 }
 
-// ensureNgramFields is called before forwarding a search on an index
+// ensureSubFields is called before forwarding a search on an index
 // expression (possibly comma-separated and/or wildcarded). Concrete daily
 // indexes are checked/patched directly; any other form (wildcard pattern,
 // alias, comma list) is resolved to its concrete indices once per pattern per
 // day and each daily index found there is patched as needed. Best-effort:
 // failures are logged, rate-limited by shouldAttempt, and the request
 // proceeds either way.
-func ensureNgramFields(idxExpr string) {
+func ensureSubFields(idxExpr string) {
 	if os.Getenv("AUTO_PATCH_NGRAM") != "1" {
 		return
 	}
@@ -326,9 +430,9 @@ func ensureNgramFields(idxExpr string) {
 		}
 		bare := strings.TrimSuffix(part, "*")
 		if dailyIndexRe.MatchString(bare) {
-			ensureNgramField(bare)
+			ensureSubField(bare)
 		} else {
-			ensureNgramPattern(part)
+			ensureSubPattern(part)
 		}
 	}
 }
@@ -344,39 +448,29 @@ func getMapping(indexOrPattern string) (json.RawMessage, bool) {
 	}
 	resp, err := mappingClient.Do(req)
 	if err != nil {
-		log.Printf("ngram patch: GET mapping %s failed: %v", indexOrPattern, err)
+		log.Printf("substring patch: GET mapping %s failed: %v", indexOrPattern, err)
 		return nil, false
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("ngram patch: GET mapping %s -> %d %s", indexOrPattern, resp.StatusCode, body)
+		log.Printf("substring patch: GET mapping %s -> %d %s", indexOrPattern, resp.StatusCode, body)
 		return nil, false
 	}
 	return json.RawMessage(body), true
 }
 
 // patchIndex checks one concrete index's mapping (already fetched) and PUTs
-// the message.ngram sub-field if it is missing. On failure the index stays
-// unmarked and is retried after the cooldown.
+// the strategy's message sub-field if it is missing. On failure the index
+// stays unmarked and is retried after the cooldown.
 func patchIndex(index string, mapping json.RawMessage) {
-	var doc struct {
-		Mappings struct {
-			Properties struct {
-				Message struct {
-					Fields struct {
-						Ngram json.RawMessage `json:"ngram"`
-					} `json:"fields"`
-				} `json:"message"`
-			} `json:"properties"`
-		} `json:"mappings"`
-	}
-	if json.Unmarshal(mapping, &doc) == nil && len(doc.Mappings.Properties.Message.Fields.Ngram) > 0 {
-		log.Printf("ngram patch: %s already has message.ngram, skip", index)
+	sub := strat.subField
+	if hasSubField(mapping, sub) {
+		log.Printf("substring patch: %s already has message.%s, skip", index, sub)
 		markDone(&patchedIndexes, index)
 		return
 	}
-	pb, _ := json.Marshal(ngramMappingPatch)
+	pb, _ := json.Marshal(strat.mappingPatch)
 	req, err := http.NewRequest(http.MethodPut, upstream.String()+"/"+index+"/_mapping", bytes.NewReader(pb))
 	if err != nil {
 		return
@@ -387,21 +481,21 @@ func patchIndex(index string, mapping json.RawMessage) {
 	}
 	resp, err := mappingClient.Do(req)
 	if err != nil {
-		log.Printf("ngram patch: PUT mapping %s failed: %v", index, err)
+		log.Printf("substring patch: PUT mapping %s failed: %v", index, err)
 		return
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
-		log.Printf("ngram patch: %s message.ngram sub-field ensured", index)
+		log.Printf("substring patch: %s message.%s sub-field ensured", index, sub)
 		markDone(&patchedIndexes, index)
 	} else {
-		log.Printf("ngram patch: PUT mapping %s -> %d %s", index, resp.StatusCode, body)
+		log.Printf("substring patch: PUT mapping %s -> %d %s", index, resp.StatusCode, body)
 	}
 }
 
-// ensureNgramField checks/patches one concrete daily index.
-func ensureNgramField(index string) {
+// ensureSubField checks/patches one concrete daily index.
+func ensureSubField(index string) {
 	if !shouldAttempt(&patchedIndexes, index) {
 		return
 	}
@@ -418,10 +512,13 @@ func ensureNgramField(index string) {
 	}
 }
 
-// ensureNgramPattern resolves a wildcard/alias index pattern to its concrete
-// indices (one resolution per pattern per day, so a newly rolled-over daily
-// index is picked up after midnight) and patches each daily index found there.
-func ensureNgramPattern(pattern string) {
+// ensureSubPattern resolves a wildcard/alias index pattern to its concrete
+// indices and patches each daily index found there. The pattern→indices
+// resolution is re-run (rate-limited by shouldAttempt) until every daily
+// index found is either patched or confirmed to already have the sub-field —
+// so one transient failure never blocks patching for the rest of the day,
+// and a newly rolled-over daily index is picked up after midnight.
+func ensureSubPattern(pattern string) {
 	key := pattern + "@" + time.Now().Format("2006-01-02")
 	if !shouldAttempt(&patternChecked, key) {
 		return
@@ -434,6 +531,7 @@ func ensureNgramPattern(pattern string) {
 	if json.Unmarshal(mapping, &m) != nil {
 		return
 	}
+	allSettled := true
 	for name, doc := range m {
 		if !dailyIndexRe.MatchString(name) {
 			continue
@@ -441,9 +539,41 @@ func ensureNgramPattern(pattern string) {
 		if v, ok := patchedIndexes.Load(name); ok && v.(patchState).done {
 			continue
 		}
-		patchIndex(name, doc)
+		if hasSubField(doc, strat.subField) {
+			log.Printf("substring patch: %s already has message.%s, skip", name, strat.subField)
+			markDone(&patchedIndexes, name)
+			continue
+		}
+		// not settled yet: try once now (respecting the per-index attempt
+		// marker so a failing index is retried at most once per cooldown)
+		if shouldAttempt(&patchedIndexes, name) {
+			patchIndexDirect(name)
+			if v, ok := patchedIndexes.Load(name); !ok || !v.(patchState).done {
+				allSettled = false
+			}
+		} else {
+			allSettled = false
+		}
 	}
-	markDone(&patternChecked, key)
+	if allSettled {
+		markDone(&patternChecked, key)
+	}
+}
+
+// patchIndexDirect fetches an index's own mapping and patches it (used when
+// a concrete index is discovered via a pattern).
+func patchIndexDirect(index string) {
+	mapping, ok := getMapping(index)
+	if !ok {
+		return
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(mapping, &m) != nil {
+		return
+	}
+	if doc, ok := m[index]; ok {
+		patchIndex(index, doc)
+	}
 }
 
 var dailyIndexRe = regexp.MustCompile(`^posts_\d{4}_\d{2}_\d{2}$`)
@@ -497,8 +627,8 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		if idx, ok := shouldRewriteIndex(r.URL.Path); ok {
 			// before forwarding the first request on a concrete daily index,
-			// make sure the message.ngram sub-field exists on it
-			ensureNgramFields(idx)
+			// make sure the mode's message sub-field exists on it
+			ensureSubFields(idx)
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
@@ -539,6 +669,11 @@ func main() {
 	upstreamStr := getenv("ES_UPSTREAM", "http://1.1.1.1:9200")
 	listenAddr = getenv("LISTEN_ADDR", ":9210")
 	prefixStr := getenv("POSTS_PATTERN", "posts")
+	substringMode := getenv("SUBSTRING_MODE", "wildcard")
+	if substringMode != "wildcard" && substringMode != "ngram" {
+		log.Fatalf("bad SUBSTRING_MODE %q: must be \"wildcard\" or \"ngram\"", substringMode)
+	}
+	strat = resolveStrategy(substringMode)
 	msm = getenv("MSM", "75%")
 
 	var err error
@@ -564,8 +699,8 @@ func main() {
 		http.Error(w, "upstream error: "+e.Error(), http.StatusBadGateway)
 	}
 
-	log.Printf("mm-es-substring-proxy listening on %s -> %s (rewrite indexes prefix=%v msm=%s)",
-		listenAddr, upstreamStr, postsPrefixes, msm)
+	log.Printf("mm-es-substring-proxy listening on %s -> %s (rewrite indexes prefix=%v mode=%s msm=%s)",
+		listenAddr, upstreamStr, postsPrefixes, strat.name, msm)
 	log.Fatal(http.ListenAndServe(listenAddr, &proxyHandler{pass: proxy}))
 }
 

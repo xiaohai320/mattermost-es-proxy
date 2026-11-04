@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Mattermost 搜索操作符回归测试（验证经 mm-es-proxy 注入 ngram 子串搜索）。
+"""Mattermost 搜索操作符回归测试（验证经 mm-es-proxy 注入子串搜索；当前默认 SUBSTRING_MODE=wildcard，切 ngram 模式后需重跑验证 ngram 分支）。
 
 覆盖操作符：FROM: / IN: / ON: / BEFORE: / AFTER: / -(排除) / ""(短语)
-以及它们与 ngram 子串匹配的组合场景。
+以及它们与子串匹配的组合场景。
 
 前置条件（本脚本会自动准备，也可手动发好）：
   team qf9qrgw4s3nkdx9mz7fa3qqhjh 下两个频道里共 6 条 ops-test-* 消息，
@@ -98,7 +98,7 @@ def case(name, terms, want=frozenset(), absent=frozenset()):
     CASES.append((name, terms, want, absent))
 
 
-# ---- 子串（ngram 核心场景）----
+# ---- 子串（子串匹配核心场景）----
 case('子串: IP 中段 55.66', '55.66', {'alpha'})
 case('子串: 邮箱中段 zhang@example', 'zhang@example', {'beta'})
 case('子串: 中文中段 盘阵列', '盘阵列', {'gamma'})
