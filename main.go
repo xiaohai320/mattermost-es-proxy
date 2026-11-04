@@ -117,6 +117,9 @@ func resolveStrategy(mode string) *strategy {
 						"type": "text",
 						"fields": map[string]interface{}{
 							"wildcard": map[string]interface{}{
+								// case folding is done query-side via
+								// case_insensitive (ES >= 7.10); the field
+								// itself needs no analyzer/normalizer
 								"type": "wildcard",
 							},
 						},
@@ -144,6 +147,10 @@ func (s *strategy) substringMatch(term string) map[string]interface{} {
 		"wildcard": map[string]interface{}{
 			"message." + s.subField: map[string]interface{}{
 				"value": "*" + escapeWildcard(term) + "*",
+				// the wildcard field type is case-SENSITIVE (verified on ES
+				// 7.17); case_insensitive (ES >= 7.10) restores the expected
+				// case-insensitive substring behavior
+				"case_insensitive": true,
 			},
 		},
 	}
@@ -460,6 +467,124 @@ func getMapping(indexOrPattern string) (json.RawMessage, bool) {
 	return json.RawMessage(body), true
 }
 
+// settingsPatchBody builds the index-settings PUT for the strategy: ngram
+// mode needs substring_analyzer (+ ngram_tokenizer) in the index settings or
+// the mapping PUT fails; wildcard mode needs nothing. Only missing
+// definitions are included so we never clobber existing settings. nil means
+// nothing to do. Note: analysis settings are non-dynamic, so on an open
+// index the PUT is rejected by ES — handled as a best-effort failure in
+// ensureSettings (close/PUT/reopen is too invasive for an auto-patcher).
+func settingsPatchBody(settings json.RawMessage) []byte {
+	if strat.name != "ngram" {
+		return nil
+	}
+	analysis := map[string]interface{}{
+		"analyzer": map[string]interface{}{
+			"substring_analyzer": map[string]interface{}{
+				"type":      "custom",
+				"tokenizer": "ngram_tokenizer",
+				"filter":    []string{"lowercase"},
+			},
+		},
+		"tokenizer": map[string]interface{}{
+			"ngram_tokenizer": map[string]interface{}{
+				"type":     "ngram",
+				"min_gram": 2,
+				"max_gram": 20,
+			},
+		},
+	}
+	// skip definitions that already exist in the index settings
+	var cur struct {
+		Index struct {
+			Analysis map[string]json.RawMessage `json:"analysis"`
+		} `json:"index"`
+	}
+	if json.Unmarshal(settings, &cur) == nil {
+		for section, defs := range analysis {
+			var existing map[string]json.RawMessage
+			if raw, ok := cur.Index.Analysis[section]; ok && json.Unmarshal(raw, &existing) == nil {
+				for name := range defs.(map[string]interface{}) {
+					if _, ok := existing[name]; ok {
+						delete(defs.(map[string]interface{}), name)
+					}
+				}
+				if len(defs.(map[string]interface{})) == 0 {
+					delete(analysis, section)
+				}
+			}
+		}
+	}
+	if len(analysis) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(map[string]interface{}{"index": map[string]interface{}{"analysis": analysis}})
+	return b
+}
+
+// ensureSettings PUTs missing analysis settings for the strategy, if any.
+// Best-effort like the mapping patch: failures are logged and the following
+// mapping PUT may then fail with "analyzer/normalizer not configured".
+func ensureSettings(index string) {
+	req, err := http.NewRequest(http.MethodGet, upstream.String()+"/"+index+"/_settings", nil)
+	if err != nil {
+		return
+	}
+	if a := patchAuthHeader(); a != "" {
+		req.Header.Set("Authorization", a)
+	}
+	resp, err := mappingClient.Do(req)
+	if err != nil {
+		log.Printf("substring patch: GET settings %s failed: %v", index, err)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("substring patch: GET settings %s -> %d %s", index, resp.StatusCode, body)
+		return
+	}
+	// body is { "<index>": { "settings": {...} } }
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return
+	}
+	doc, ok := m[index]
+	if !ok {
+		return
+	}
+	var wrapper struct {
+		Settings json.RawMessage `json:"settings"`
+	}
+	if json.Unmarshal(doc, &wrapper) != nil {
+		return
+	}
+	pb := settingsPatchBody(wrapper.Settings)
+	if pb == nil {
+		return
+	}
+	req, err = http.NewRequest(http.MethodPut, upstream.String()+"/"+index+"/_settings", bytes.NewReader(pb))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if a := patchAuthHeader(); a != "" {
+		req.Header.Set("Authorization", a)
+	}
+	resp, err = mappingClient.Do(req)
+	if err != nil {
+		log.Printf("substring patch: PUT settings %s failed: %v", index, err)
+		return
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("substring patch: %s analysis settings ensured", index)
+	} else {
+		log.Printf("substring patch: PUT settings %s -> %d %s", index, resp.StatusCode, body)
+	}
+}
+
 // patchIndex checks one concrete index's mapping (already fetched) and PUTs
 // the strategy's message sub-field if it is missing. On failure the index
 // stays unmarked and is retried after the cooldown.
@@ -470,6 +595,10 @@ func patchIndex(index string, mapping json.RawMessage) {
 		markDone(&patchedIndexes, index)
 		return
 	}
+	// the sub-field definition may reference an analysis definition
+	// (normalizer for wildcard, analyzer for ngram); make sure the index
+	// settings have it before adding the field
+	ensureSettings(index)
 	pb, _ := json.Marshal(strat.mappingPatch)
 	req, err := http.NewRequest(http.MethodPut, upstream.String()+"/"+index+"/_mapping", bytes.NewReader(pb))
 	if err != nil {
